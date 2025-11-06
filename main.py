@@ -1,6 +1,9 @@
 import os
+import json
+from typing import Dict
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import requests
 
 app = FastAPI()
 
@@ -63,6 +66,89 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
     
     return response
+
+
+# ------------------------ QUIZ (Gemini w/ Safe Fallback) ------------------------
+
+def _fallback_question() -> Dict[str, str]:
+    """Return a deterministic, mid-level quiz when Gemini is unavailable.
+    Kept simple to avoid leaking internal details and to ensure reliability."""
+    pool = [
+        {
+            "prompt": "If f(x) = 2x^2 - 3x + 1, what is f(3)?",
+            "solution": "10"
+        },
+        {
+            "prompt": "Which planet has the strongest surface gravity among Earth, Mars, and Jupiter?",
+            "solution": "Jupiter"
+        },
+        {
+            "prompt": "Who wrote the play 'Hamlet'?",
+            "solution": "William Shakespeare"
+        },
+        {
+            "prompt": "In chemistry, what is the pH of a neutral solution at 25°C?",
+            "solution": "7"
+        },
+        {
+            "prompt": "What is the Big-O time complexity of binary search on a sorted array?",
+            "solution": "O(log n)"
+        },
+    ]
+    # Pseudo-random selection without importing random to keep surface small
+    idx = (len(os.getenv("HOSTNAME", "x")) + len(os.getenv("PORT", "0"))) % len(pool)
+    return pool[idx]
+
+@app.get("/quiz")
+def get_quiz():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return _fallback_question()
+
+    try:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+        headers = {"Content-Type": "application/json"}
+        system_prompt = (
+            "Generate one mid-level trivia question suitable for two teams playing locally. "
+            "Output strictly as compact JSON with keys 'prompt' and 'solution'. "
+            "Avoid code blocks or extra commentary."
+        )
+        body = {
+            "contents": [
+                {"parts": [{"text": system_prompt}]}
+            ]
+        }
+        resp = requests.post(url, headers=headers, params={"key": api_key}, data=json.dumps(body), timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        # Extract text response safely
+        text = None
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            text = None
+        if not text:
+            return _fallback_question()
+        # Ensure we parse JSON even if model wrapped it in code fences
+        text_stripped = text.strip().strip('`')
+        # Find first { ... }
+        start = text_stripped.find('{')
+        end = text_stripped.rfind('}')
+        if start == -1 or end == -1:
+            return _fallback_question()
+        json_str = text_stripped[start:end+1]
+        obj = json.loads(json_str)
+        prompt = str(obj.get("prompt", "")).strip()
+        solution = str(obj.get("solution", "")).strip()
+        if not prompt or not solution:
+            return _fallback_question()
+        # Basic output length limits to mitigate prompt injection/overlong payloads
+        prompt = prompt[:300]
+        solution = solution[:100]
+        return {"prompt": prompt, "solution": solution}
+    except Exception:
+        # Never leak internal errors to client
+        return _fallback_question()
 
 
 if __name__ == "__main__":
